@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 2.8)
+project(Azure_Kinect_Capture)
+find_package(OpenCV REQUIRED)
+find_package(k4a REQUIRED)
+
+add_executable(Azure_Kinect_Capture  grab_images_k4a.cpp)
+target_link_libraries(Azure_Kinect_Capture ${OpenCV_LIBS} k4a::k4a )
+
