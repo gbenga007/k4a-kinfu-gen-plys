@@ -117,322 +117,256 @@ int CreateDirectory(std::string dirDest){
 
 //k4arecorder -l 5 -d WFOV_UNBINNED -r 5 --imu OFF recording.mkv
 
-void validate_input_files(char* argv[], int argc, std::vector<std::string>& filenames)
-{
-    
-    // this is to ensure that all the supplied files terminate with a '.mkv' extension
-    for(int i{1}; i < argc; i++){
-        std::string tmp = argv[i];
-        size_t pos = tmp.rfind('.');
 
-        if (pos == std::string::npos){
-            std::cout << "'" << tmp << "' is not a valid file, ignoring..." << std::endl;
-            continue;
-        }
-        
-        std::string ext = tmp.substr(pos+1);
-
-        if (ext == "mkv"){
-            filenames.emplace_back(argv[i]);
-        }
-    }
-
-}
-
-void create_output_fnames(const std::vector<std::string>& filenames, std::vector<std::string>& output_filenames ){
-
-    // replace .mkv with .ply
-        for( const auto& filename : filenames){
-            size_t lastindex = filename.find_last_of("."); 
-            std::string rawname = filename.substr(0, lastindex); 
-            output_filenames.emplace_back(rawname + ".ply");
-        }
-}
-
-
-
-template<typename T>
-void print_vector(const std::vector<T>& vector,const std::string& delim)
-{
-    for(const auto& item : vector){
-        std::cout << item << delim;
-    }
-    std::cout << std::endl;
-}
 
 int main(int argc, char **argv)
 {
+
+    if(argc < 3){
+        std::cout << "\n\tUsage : " << argv[0] << " <recording.mkv> <output ply file name>" << std::endl;
+        return -1;
+    }
     int returnCode = 1;
-    if(argc < 2){
-        std::cout << "\n\tUsage : " << argv[0] << " <view1.mkv> <view2.mkv> ..." << std::endl;
+    k4a_device_t device = NULL;
+    const int32_t TIMEOUT_IN_MS = 1000;
+
+    setUseOptimized(true);
+    
+    k4a_image_t depth_image = NULL;
+    k4a_image_t undistorted_depth_image = NULL;
+    k4a_capture_t capture = NULL;
+    k4a_image_t lut = NULL;
+    k4a_transformation_t transformation = NULL;
+    interpolation_t interpolation_type = INTERPOLATION_BILINEAR_DEPTH;
+    pinhole_t pinhole;
+    k4a_calibration_t calibration;
+
+    /* Read data from Capture MKV file */
+    /* Apply Kinect Fusion to the stream */
+    string inputFname = argv[1];
+    k4a_playback_t playback = NULL;
+    k4a_result_t result;
+    k4a_stream_result_t stream_result = K4A_STREAM_RESULT_SUCCEEDED; // init to success state and watch for change later
+
+    // this opens the recording stored in inputFname
+    result = k4a_playback_open(inputFname.c_str(),&playback);
+    
+    if(result != K4A_RESULT_SUCCEEDED || playback == NULL){
+        std::cout<<"Failed to open the recording: " << inputFname << std::endl;
+        
+        if(playback != NULL){
+            k4a_playback_close(playback);
+        }
         return -1;
     }
-    std::vector<std::string> filenames, output_filenames;
-    std::vector<char>stars(100,'=');
-
-    validate_input_files(argv, argc,filenames);
-
-    if(filenames.empty()){
-        std::cout << "Failed to provide valid input files. Exiting program..." << std::endl;
+    if (K4A_RESULT_SUCCEEDED != k4a_playback_get_calibration(playback, &calibration)){
+        std::cout << "Failed to get calibration" << std::endl;
+        if(playback != NULL){
+            k4a_playback_close(playback);
+        }
         return -1;
+            
     }
 
-    print_vector(stars, "");
-    std::cout << "Creating PLY's for : \n\t";
-    print_vector(filenames," ");
-    print_vector(stars,"");
-    create_output_fnames(filenames, output_filenames);
- 
-    //return 0;
+    transformation = k4a_transformation_create(&calibration);
+    // Generate a pinhole model for depth camera
+    pinhole = create_pinhole_from_xy_range(&calibration, K4A_CALIBRATION_TYPE_DEPTH);
+    k4a_image_create(K4A_IMAGE_FORMAT_CUSTOM,
+                     pinhole.width,
+                     pinhole.height,
+                     pinhole.width * (int)sizeof(coordinate_t),
+                     &lut);
 
-    for(int i{0}; i < filenames.size(); i++){
-        std::string inputFname = filenames[i];
+    create_undistortion_lut(&calibration, K4A_CALIBRATION_TYPE_DEPTH, &pinhole, lut, interpolation_type);
+    // Retrieve calibration parameters
+    k4a_calibration_intrinsic_parameters_t *intrinsics = &calibration.depth_camera_calibration.intrinsics.parameters;
+    const int width = calibration.depth_camera_calibration.resolution_width;
+    const int height = calibration.depth_camera_calibration.resolution_height;
 
-       
-        k4a_device_t device = NULL;
-        const int32_t TIMEOUT_IN_MS = 1000;
+    // Initialize kinfu parameters
+    Ptr<kinfu::Params> params;
+    params = kinfu::Params::defaultParams();
+    initialize_kinfu_params(
+        *params, width, height, pinhole.fx, pinhole.fy, pinhole.px, pinhole.py);
 
-        setUseOptimized(true);
+    // Distortion coefficients
+    Matx<float, 1, 8> distCoeffs;
+    distCoeffs(0) = intrinsics->param.k1;
+    distCoeffs(1) = intrinsics->param.k2;
+    distCoeffs(2) = intrinsics->param.p1;
+    distCoeffs(3) = intrinsics->param.p2;
+    distCoeffs(4) = intrinsics->param.k3;
+    distCoeffs(5) = intrinsics->param.k4;
+    distCoeffs(6) = intrinsics->param.k5;
+    distCoeffs(7) = intrinsics->param.k6;
+
+   // Create KinectFusion module instance
+    Ptr<kinfu::KinFu> kf;
+    kf = kinfu::KinFu::create(params);
+    //namedWindow("AzureKinect KinectFusion Example");
+    //viz::Viz3d visualization("AzureKinect KinectFusion Example");
+
+    bool stop = false;
+    bool renderViz = false;  
+    UMat points;
+    UMat normals;
+    // Streaming here
+    int iter = 0;
+    while(stream_result == K4A_STREAM_RESULT_SUCCEEDED){
         
-        k4a_image_t depth_image = NULL;
-        k4a_image_t undistorted_depth_image = NULL;
-        k4a_capture_t capture = NULL;
-        k4a_image_t lut = NULL;
-        k4a_transformation_t transformation = NULL;
-        interpolation_t interpolation_type = INTERPOLATION_BILINEAR_DEPTH;
-        pinhole_t pinhole;
-        k4a_calibration_t calibration;
-
-        /* Read data from Capture MKV file */
-        /* Apply Kinect Fusion to the stream */
-        k4a_playback_t playback = NULL;
-        k4a_result_t result;
-        k4a_stream_result_t stream_result = K4A_STREAM_RESULT_SUCCEEDED; // init to success state and watch for change later
-
-        // this opens the recording stored in inputFname
-        result = k4a_playback_open(inputFname.c_str(),&playback);
+        stream_result = k4a_playback_get_next_capture(playback,&capture);
         
-        if(result != K4A_RESULT_SUCCEEDED || playback == NULL){
-            std::cout<<"Failed to open the recording: " << inputFname << std::endl;
-            
-            if(playback != NULL){
-                k4a_playback_close(playback);
-            }
-            return -1;
+        if (stream_result == K4A_STREAM_RESULT_EOF)
+        {
+            // End of file reached
+            break;
         }
-        if (K4A_RESULT_SUCCEEDED != k4a_playback_get_calibration(playback, &calibration)){
-            std::cout << "Failed to get calibration" << std::endl;
-            if(playback != NULL){
-                k4a_playback_close(playback);
-            }
-            return -1;
-                
+        // Fetch frame
+        depth_image = k4a_capture_get_depth_image(capture);
+        if (depth_image == 0)
+        {
+            std::cout<<"Failed to get depth image from capture" << std::endl;
+            break;
         }
 
-        transformation = k4a_transformation_create(&calibration);
-        // Generate a pinhole model for depth camera
-        pinhole = create_pinhole_from_xy_range(&calibration, K4A_CALIBRATION_TYPE_DEPTH);
-        k4a_image_create(K4A_IMAGE_FORMAT_CUSTOM,
-                        pinhole.width,
-                        pinhole.height,
-                        pinhole.width * (int)sizeof(coordinate_t),
-                        &lut);
-
-        create_undistortion_lut(&calibration, K4A_CALIBRATION_TYPE_DEPTH, &pinhole, lut, interpolation_type);
-        // Retrieve calibration parameters
-        k4a_calibration_intrinsic_parameters_t *intrinsics = &calibration.depth_camera_calibration.intrinsics.parameters;
-        const int width = calibration.depth_camera_calibration.resolution_width;
-        const int height = calibration.depth_camera_calibration.resolution_height;
-
-        // Initialize kinfu parameters
-        //Ptr<colored_kinfu::Params> params;
-        //bool coarse = false;
-        //params = colored_kinfu::Params::coloredTSDFParams(coarse);
-        Ptr<kinfu::Params> params;
-        params = kinfu::Params::defaultParams();
-
-        initialize_kinfu_params(
-            *params, width, height, pinhole.fx, pinhole.fy, pinhole.px, pinhole.py);
-
-        // Distortion coefficients
-        Matx<float, 1, 8> distCoeffs;
-        distCoeffs(0) = intrinsics->param.k1;
-        distCoeffs(1) = intrinsics->param.k2;
-        distCoeffs(2) = intrinsics->param.p1;
-        distCoeffs(3) = intrinsics->param.p2;
-        distCoeffs(4) = intrinsics->param.k3;
-        distCoeffs(5) = intrinsics->param.k4;
-        distCoeffs(6) = intrinsics->param.k5;
-        distCoeffs(7) = intrinsics->param.k6;
-
-    // Create KinectFusion module instance
-        Ptr<kinfu::KinFu> kf;
-        kf = kinfu::KinFu::create(params);
-        //namedWindow("AzureKinect KinectFusion Example");
-        //viz::Viz3d visualization("AzureKinect KinectFusion Example");
-
-        bool stop = false;
-        bool renderViz = false;  
-        UMat points;
-        UMat normals;
-        // Streaming here
-        int iter = 0;
-        while(stream_result == K4A_STREAM_RESULT_SUCCEEDED){
-            
-            stream_result = k4a_playback_get_next_capture(playback,&capture);
-            
-            if (stream_result == K4A_STREAM_RESULT_EOF)
-            {
-                // End of file reached
-                break;
-            }
-            // Fetch frame
-            depth_image = k4a_capture_get_depth_image(capture);
-            if (depth_image == 0)
-            {
-                std::cout<<"Failed to get depth image from capture" << std::endl;
-                continue;
-            }
-            
-            std::cout<<"Got a depth image from capture" << std::endl;
-            // Once we acquire the depth, we run it through the kinect fusion pipeline
-            
-            // Undistort the depth
-            k4a_image_create(K4A_IMAGE_FORMAT_DEPTH16,
-                            pinhole.width,
-                            pinhole.height,
-                            pinhole.width * (int)sizeof(uint16_t),
-                            &undistorted_depth_image);
-            remap(depth_image, lut, undistorted_depth_image, interpolation_type);
-
-            // Create frame from depth buffer
-            uint8_t *buffer = k4a_image_get_buffer(undistorted_depth_image);
-            uint16_t *depth_buffer = reinterpret_cast<uint16_t *>(buffer);
-            UMat undistortedFrame;
-            create_mat_from_buffer<uint16_t>(depth_buffer, width, height).copyTo(undistortedFrame);
-
-            if (undistortedFrame.empty())
-            {
-                k4a_image_release(depth_image);
-                k4a_image_release(undistorted_depth_image);
-                k4a_capture_release(capture);
-                continue;
-            }
-
-            // Update KinectFusion
-            if (!kf->update(undistortedFrame))
-            {
-                printf("Reset KinectFusion\n");
-                kf->reset();
-                k4a_image_release(depth_image);
-                k4a_image_release(undistorted_depth_image);
-                k4a_capture_release(capture);
-                continue;
-            }
-
-            // Retrieve rendered TSDF
-            UMat tsdfRender;
-            kf->render(tsdfRender);
-
-            // Retrieve fused point cloud and normals
-            kf->getCloud(points, normals);
-
-            // Show TSDF rendering
-            //imshow("AzureKinect KinectFusion Example", tsdfRender);
-
-            // Show fused point cloud and normals
-            /*
-            if (!points.empty() && !normals.empty() && renderViz)
-            {
-                viz::WCloud cloud(points, viz::Color::white());
-                viz::WCloudNormals cloudNormals(points, normals, 1, 0.01, viz::Color::cyan());
-                visualization.showWidget("cloud", cloud);
-                visualization.showWidget("normals", cloudNormals);
-                visualization.showWidget("worldAxes", viz::WCoordinateSystem());
-                Vec3d volSize = kf->getParams().voxelSize * kf->getParams().volumeDims;
-                visualization.showWidget("cube", viz::WCube(Vec3d::all(0), volSize), kf->getParams().volumePose);
-                visualization.spinOnce(1, true);
-            }
-            */
-
+        // Once we acquire the depth, we run it through the kinect fusion pipeline
         
-        
+        // Undistort the depth
+        k4a_image_create(K4A_IMAGE_FORMAT_DEPTH16,
+                         pinhole.width,
+                         pinhole.height,
+                         pinhole.width * (int)sizeof(uint16_t),
+                         &undistorted_depth_image);
+        remap(depth_image, lut, undistorted_depth_image, interpolation_type);
+
+        // Create frame from depth buffer
+        uint8_t *buffer = k4a_image_get_buffer(undistorted_depth_image);
+        uint16_t *depth_buffer = reinterpret_cast<uint16_t *>(buffer);
+        UMat undistortedFrame;
+        create_mat_from_buffer<uint16_t>(depth_buffer, width, height).copyTo(undistortedFrame);
+
+        if (undistortedFrame.empty())
+        {
             k4a_image_release(depth_image);
             k4a_image_release(undistorted_depth_image);
             k4a_capture_release(capture);
+            continue;
         }
 
-        // Output the fused point cloud from KinectFusion
-            Mat out_points;
-            Mat out_normals;
-            points.copyTo(out_points);
-            normals.copyTo(out_normals);
-
-            std::cout<<"Saving fused point cloud into ply file : " << output_filenames[i] <<  std::endl;
-
-            // Save to the ply file
-        #define PLY_START_HEADER "ply"
-        #define PLY_END_HEADER "end_header"
-        #define PLY_ASCII "format ascii 1.0"
-        #define PLY_ELEMENT_VERTEX "element vertex"
-            
-            std::string output_file_name = output_filenames[i];
-            ofstream ofs(output_file_name); // text mode first
-            ofs << PLY_START_HEADER << endl;
-            ofs << PLY_ASCII << endl;
-            ofs << PLY_ELEMENT_VERTEX << " " << out_points.rows << endl;
-            ofs << "property float x" << endl;
-            ofs << "property float y" << endl;
-            ofs << "property float z" << endl;
-            ofs << "property float nx" << endl;
-            ofs << "property float ny" << endl;
-            ofs << "property float nz" << endl;
-            ofs << PLY_END_HEADER << endl;
-            ofs.close();
-
-            stringstream ss;
-            for (int i = 0; i < out_points.rows; ++i)
-            {
-                ss << out_points.at<float>(i, 0) << " "
-                    << out_points.at<float>(i, 1) << " "
-                    << out_points.at<float>(i, 2) << " "
-                    << out_normals.at<float>(i, 0) << " "
-                    << out_normals.at<float>(i, 1) << " "
-                    << out_normals.at<float>(i, 2) << endl;
-            }
-            ofstream ofs_text(output_file_name, ios::out | ios::app);
-            ofs_text.write(ss.str().c_str(), (streamsize)ss.str().length());
-
-
-
-        if (playback != NULL)
+        // Update KinectFusion
+        if (!kf->update(undistortedFrame))
         {
-            k4a_playback_close(playback);
-            returnCode = -1;
-        }
-
-        if (capture != NULL)
-        {
+            printf("Reset KinectFusion\n");
+            kf->reset();
+            k4a_image_release(depth_image);
+            k4a_image_release(undistorted_depth_image);
             k4a_capture_release(capture);
-            returnCode = -1;
+            continue;
         }
 
-        if (transformation != NULL)
+        // Retrieve rendered TSDF
+        UMat tsdfRender;
+        kf->render(tsdfRender);
+
+        // Retrieve fused point cloud and normals
+        kf->getCloud(points, normals);
+
+        // Show TSDF rendering
+        //imshow("AzureKinect KinectFusion Example", tsdfRender);
+
+        // Show fused point cloud and normals
+        /*
+        if (!points.empty() && !normals.empty() && renderViz)
         {
-            k4a_transformation_destroy(transformation);
-            returnCode = -1;
+            viz::WCloud cloud(points, viz::Color::white());
+            viz::WCloudNormals cloudNormals(points, normals, 1, 0.01, viz::Color::cyan());
+            visualization.showWidget("cloud", cloud);
+            visualization.showWidget("normals", cloudNormals);
+            visualization.showWidget("worldAxes", viz::WCoordinateSystem());
+            Vec3d volSize = kf->getParams().voxelSize * kf->getParams().volumeDims;
+            visualization.showWidget("cube", viz::WCube(Vec3d::all(0), volSize), kf->getParams().volumePose);
+            visualization.spinOnce(1, true);
         }
+        */
 
-        if (stream_result == K4A_STREAM_RESULT_FAILED){
-            std::cout<<"Failed to read entire recording" << std::endl;
-            returnCode = -1;
-        }
-    
-        k4a_image_release(lut);
-        
-        destroyAllWindows();
+       
+       
+        k4a_image_release(depth_image);
+        k4a_image_release(undistorted_depth_image);
+        k4a_capture_release(capture);
     }
-        return returnCode;
+
+     // Output the fused point cloud from KinectFusion
+        Mat out_points;
+        Mat out_normals;
+        points.copyTo(out_points);
+        normals.copyTo(out_normals);
+
+        std::cout<<"Saving fused point cloud into ply file ..." << std::endl;
+
+        // Save to the ply file
+    #define PLY_START_HEADER "ply"
+    #define PLY_END_HEADER "end_header"
+    #define PLY_ASCII "format ascii 1.0"
+    #define PLY_ELEMENT_VERTEX "element vertex"
+        std::ostringstream output_file_name;
+        output_file_name << argv[2] <<".ply";
+        ofstream ofs(output_file_name.str()); // text mode first
+        ofs << PLY_START_HEADER << endl;
+        ofs << PLY_ASCII << endl;
+        ofs << PLY_ELEMENT_VERTEX << " " << out_points.rows << endl;
+        ofs << "property float x" << endl;
+        ofs << "property float y" << endl;
+        ofs << "property float z" << endl;
+        ofs << "property float nx" << endl;
+        ofs << "property float ny" << endl;
+        ofs << "property float nz" << endl;
+        ofs << PLY_END_HEADER << endl;
+        ofs.close();
+
+        stringstream ss;
+        for (int i = 0; i < out_points.rows; ++i)
+        {
+            ss << out_points.at<float>(i, 0) << " "
+                << out_points.at<float>(i, 1) << " "
+                << out_points.at<float>(i, 2) << " "
+                << out_normals.at<float>(i, 0) << " "
+                << out_normals.at<float>(i, 1) << " "
+                << out_normals.at<float>(i, 2) << endl;
+        }
+        ofstream ofs_text(output_file_name.str(), ios::out | ios::app);
+        ofs_text.write(ss.str().c_str(), (streamsize)ss.str().length());
+
+
+
+    if (playback != NULL)
+    {
+        k4a_playback_close(playback);
+        returnCode = -1;
+    }
+
+    if (capture != NULL)
+    {
+        k4a_capture_release(capture);
+        returnCode = -1;
+    }
+
+    if (transformation != NULL)
+    {
+        k4a_transformation_destroy(transformation);
+        returnCode = -1;
+    }
+
+    if (stream_result == K4A_STREAM_RESULT_FAILED){
+        std::cout<<"Failed to read entire recording" << std::endl;
+        returnCode = -1;
+    }
+   
+    k4a_image_release(lut);
+    
+    destroyAllWindows();
+
+    return returnCode;
 }
 
 
