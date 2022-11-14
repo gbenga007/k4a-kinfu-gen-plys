@@ -1,1 +1,1 @@
-this code reads in the mkv file and applie Kinect fusion to create the PLY file.
+This code reads in a set of mkv files and applies the Kinect fusion algorithm to create  a corresponding set PLY files.
